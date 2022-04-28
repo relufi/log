@@ -1466,8 +1466,8 @@ where
     let old_state = match STATE.compare_exchange(
         UNINITIALIZED,
         INITIALIZING,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
     ) {
         Ok(s) | Err(s) => s,
     };
@@ -1476,19 +1476,20 @@ where
             unsafe {
                 LOGGER = make_logger();
             }
-            STATE.store(INITIALIZED, Ordering::SeqCst);
-            Ok(())
+            STATE.store(INITIALIZED, Ordering::Release);
+            return Ok(());
         }
         INITIALIZING => {
-            while STATE.load(Ordering::SeqCst) == INITIALIZING {
+            while STATE.load(Ordering::Relaxed) == INITIALIZING {
                 // TODO: replace with `hint::spin_loop` once MSRV is 1.49.0.
                 #[allow(deprecated)]
                 std::sync::atomic::spin_loop_hint();
             }
-            Err(SetLoggerError(()))
         }
-        _ => Err(SetLoggerError(())),
-    }
+        _ => {},
+    };
+    std::sync::atomic::fence(Ordering::Acquire);
+    Err(SetLoggerError(()))
 }
 
 /// A thread-unsafe version of [`set_logger`].
@@ -1511,17 +1512,20 @@ where
 ///
 /// [`set_logger`]: fn.set_logger.html
 pub unsafe fn set_logger_racy(logger: &'static dyn Log) -> Result<(), SetLoggerError> {
-    match STATE.load(Ordering::SeqCst) {
+    match STATE.load(Ordering::Relaxed) {
         UNINITIALIZED => {
             LOGGER = logger;
-            STATE.store(INITIALIZED, Ordering::SeqCst);
+            STATE.store(INITIALIZED, Ordering::Relaxed);
             Ok(())
         }
         INITIALIZING => {
             // This is just plain UB, since we were racing another initialization function
             unreachable!("set_logger_racy must not be used with other initialization functions")
         }
-        _ => Err(SetLoggerError(())),
+        _ => {
+            std::sync::atomic::fence(Ordering::Acquire);
+            Err(SetLoggerError(()))
+        },
     }
 }
 
@@ -1563,12 +1567,13 @@ impl error::Error for ParseLevelError {}
 ///
 /// If a logger has not been set, a no-op implementation is returned.
 pub fn logger() -> &'static dyn Log {
-    if STATE.load(Ordering::SeqCst) != INITIALIZED {
+    unsafe { LOGGER }
+    /*if STATE.load(Ordering::SeqCst) != INITIALIZED {
         static NOP: NopLogger = NopLogger;
         &NOP
     } else {
         unsafe { LOGGER }
-    }
+    }*/
 }
 
 // WARNING: this is not part of the crate's public API and is subject to change at any time
@@ -1959,5 +1964,35 @@ mod tests {
             #[cfg(feature = "std")]
             assert_is_log::<Arc<T>>();
         }
+    }
+
+
+    #[cfg(has_atomics)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::{Record,Metadata,Log,set_max_level,set_logger};
+
+    #[test]
+    fn test_log() {
+        static LOG_R:AtomicUsize = AtomicUsize::new(0);
+        static TEST_CC_LOG: TestCcLog = TestCcLog;
+        struct TestCcLog;
+        impl Log for TestCcLog {
+            fn enabled(&self, _: &Metadata) -> bool { true }
+            fn log(&self, _: &Record) {
+                LOG_R.fetch_add(1,Ordering::Relaxed);
+            }
+            fn flush(&self) {}
+        }
+
+        let num = 1000;
+        set_max_level(LevelFilter::Debug);
+        let js:Vec<_> = (0..num).map(|_| {
+            std::thread::spawn(|| {
+                let _ = set_logger(&TEST_CC_LOG);
+                debug!("test");
+            })
+        }).collect();
+        js.into_iter().for_each(|j| {let _ = j.join();});
+        assert_eq!(LOG_R.load(Ordering::Relaxed),num);
     }
 }
